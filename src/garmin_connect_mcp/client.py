@@ -1,5 +1,6 @@
 """Garmin Connect API client wrapper with error handling."""
 
+import json as _json
 import sys
 from pathlib import Path
 from typing import Any
@@ -174,5 +175,66 @@ class GarminClientWrapper:
                 raise GarminAuthenticationError(original_error=e) from e
             else:
                 raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+        except Exception as e:
+            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+
+    def schedule_workout(self, workout_id: int, date: str) -> Any:
+        """
+        Schedule a workout to a specific date via POST request.
+
+        Scheduling puts it on the Garmin Connect calendar, which triggers
+        auto-sync to the watch (workouts for the next 15 days sync automatically).
+        """
+        try:
+            url = f"/workout-service/schedule/{workout_id}"
+            payload = {"date": date}
+            response = self.client.garth.post("connectapi", url, json=payload, api=True)
+            try:
+                return response.json()
+            except Exception:
+                return {"status": "ok", "workout_id": workout_id, "date": date}
+        except GarthHTTPError as e:
+            error_str = str(e)
+            if "429" in error_str:
+                raise GarminRateLimitError(original_error=e) from e
+            elif "404" in error_str:
+                raise GarminNotFoundError("Workout", original_error=e) from e
+            elif "401" in error_str or "403" in error_str:
+                raise GarminAuthenticationError(original_error=e) from e
+            else:
+                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+        except Exception as e:
+            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+
+    def update_workout(self, workout_id: int, workout_data: str | dict) -> Any:
+        """
+        Update an existing workout by ID via PUT request.
+
+        The garminconnect library doesn't expose this, so we call garth directly.
+        """
+        try:
+            if isinstance(workout_data, str):
+                payload = _json.loads(workout_data)
+            else:
+                payload = workout_data
+
+            url = f"/workout-service/workout/{workout_id}"
+            response = self.client.garth.put("connectapi", url, json=payload, api=True)
+            try:
+                return response.json()
+            except Exception:
+                return {"status": "ok", "workout_id": workout_id}
+        except GarthHTTPError as e:
+            error_str = str(e)
+            if "429" in error_str:
+                raise GarminRateLimitError(original_error=e) from e
+            elif "404" in error_str:
+                raise GarminNotFoundError("Workout", original_error=e) from e
+            elif "401" in error_str or "403" in error_str:
+                raise GarminAuthenticationError(original_error=e) from e
+            else:
+                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+        except _json.JSONDecodeError as e:
+            raise GarminAPIError(f"Invalid workout JSON: {str(e)}", original_error=e) from e
         except Exception as e:
             raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
