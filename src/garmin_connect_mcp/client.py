@@ -206,6 +206,30 @@ class GarminClientWrapper:
         except Exception as e:
             raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
 
+    def unschedule_workout(self, schedule_id: int) -> Any:
+        """
+        Remove a scheduled workout from the Garmin calendar via DELETE request.
+
+        Args:
+            schedule_id: The workoutScheduleId returned when the workout was scheduled.
+        """
+        try:
+            url = f"/workout-service/schedule/{schedule_id}"
+            response = self.client.garth.delete("connectapi", url, api=True)
+            return {"status": "ok", "schedule_id": schedule_id}
+        except GarthHTTPError as e:
+            error_str = str(e)
+            if "429" in error_str:
+                raise GarminRateLimitError(original_error=e) from e
+            elif "404" in error_str:
+                raise GarminNotFoundError("Workout schedule", original_error=e) from e
+            elif "401" in error_str or "403" in error_str:
+                raise GarminAuthenticationError(original_error=e) from e
+            else:
+                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+        except Exception as e:
+            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+
     def update_workout(self, workout_id: int, workout_data: str | dict) -> Any:
         """
         Update an existing workout by ID via PUT request.
