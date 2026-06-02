@@ -230,6 +230,149 @@ class GarminClientWrapper:
         except Exception as e:
             raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
 
+    def get_scheduled_workouts(self, start_date: str, end_date: str) -> list[dict]:
+        """
+        List workouts scheduled on the Garmin calendar within a date range.
+
+        The garminconnect library doesn't expose the calendar service, so we call
+        garth directly. The calendar-service month endpoint uses a 0-indexed month
+        (0 = January) and returns ``calendarItems``; for workout items the ``id``
+        field IS the workoutScheduleId needed to unschedule, and ``workoutId`` is
+        the library workout id.
+
+        Args:
+            start_date: Range start, YYYY-MM-DD (inclusive).
+            end_date: Range end, YYYY-MM-DD (inclusive).
+
+        Returns:
+            List of {scheduleId, workoutId, title, date} dicts sorted by date.
+        """
+        from datetime import date as _date
+
+        try:
+            sy, sm, sd = (int(p) for p in start_date.split("-"))
+            ey, em, ed = (int(p) for p in end_date.split("-"))
+            start = _date(sy, sm, sd)
+            end = _date(ey, em, ed)
+            if end < start:
+                start, end = end, start
+
+            start_iso, end_iso = start.isoformat(), end.isoformat()
+            results: list[dict] = []
+            # calendar-service month payloads include adjacent-month grid-overflow
+            # days, so a date near a month boundary appears in two months' payloads.
+            # Dedupe by scheduleId so each scheduled workout is returned once.
+            seen_ids: set = set()
+            year, month = start.year, start.month
+            while (year, month) <= (end.year, end.month):
+                # calendar-service month is 0-indexed (0 = January)
+                url = f"/calendar-service/year/{year}/month/{month - 1}"
+                response = self.client.garth.get("connectapi", url, api=True)
+                data = response.json()
+                for item in data.get("calendarItems", []) or []:
+                    if item.get("itemType") != "workout":
+                        continue
+                    item_date = item.get("date")
+                    schedule_id = item.get("id")
+                    if item_date and start_iso <= item_date <= end_iso and schedule_id not in seen_ids:
+                        seen_ids.add(schedule_id)
+                        results.append(
+                            {
+                                "scheduleId": schedule_id,
+                                "workoutId": item.get("workoutId"),
+                                "title": item.get("title"),
+                                "date": item_date,
+                            }
+                        )
+                month = 1 if month == 12 else month + 1
+                if month == 1:
+                    year += 1
+
+            results.sort(key=lambda r: (r.get("date") or "", r.get("title") or ""))
+            return results
+        except GarthHTTPError as e:
+            error_str = str(e)
+            if "429" in error_str:
+                raise GarminRateLimitError(original_error=e) from e
+            elif "401" in error_str or "403" in error_str:
+                raise GarminAuthenticationError(original_error=e) from e
+            else:
+                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+        except (ValueError, TypeError) as e:
+            raise GarminAPIError(f"Invalid date (expected YYYY-MM-DD): {str(e)}", original_error=e) from e
+        except Exception as e:
+            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+
+    def reschedule_workout(
+        self,
+        workout_id: int,
+        date: str,
+        search_start: str | None = None,
+        search_end: str | None = None,
+    ) -> dict:
+        """
+        Move a workout to a target date, removing any existing scheduled entries
+        for the same workout first — so a reschedule can't leave a duplicate.
+
+        Garmin's ``schedule`` action only ever ADDS a calendar entry; it never
+        replaces one. Rescheduling naively therefore leaves the old entry behind.
+        This method closes that gap: it lists scheduled workouts in a window
+        around the target date, unschedules every entry whose ``workoutId``
+        matches, then schedules the workout to ``date``. Net result: exactly one
+        entry, on the right day.
+
+        Args:
+            workout_id: Library workout id to (re)schedule.
+            date: Target date, YYYY-MM-DD.
+            search_start: Optional window start (YYYY-MM-DD). Defaults to 14 days
+                before the target date.
+            search_end: Optional window end (YYYY-MM-DD). Defaults to 21 days
+                after the target date.
+
+        Returns:
+            {workout_id, scheduled_date, new_schedule_id, removed_duplicates, schedule_result}
+        """
+        from datetime import date as _date, timedelta
+
+        try:
+            ty, tm, td = (int(p) for p in date.split("-"))
+            target = _date(ty, tm, td)
+        except (ValueError, TypeError) as e:
+            raise GarminAPIError(f"Invalid date (expected YYYY-MM-DD): {str(e)}", original_error=e) from e
+
+        window_start = search_start or (target - timedelta(days=14)).isoformat()
+        window_end = search_end or (target + timedelta(days=21)).isoformat()
+
+        existing = self.get_scheduled_workouts(window_start, window_end)
+        removed: list[dict] = []
+        phantom: list[dict] = []
+        for entry in existing:
+            if entry.get("workoutId") == workout_id and entry.get("scheduleId") is not None:
+                schedule_id = entry["scheduleId"]
+                try:
+                    self.unschedule_workout(schedule_id)
+                    removed.append({"scheduleId": schedule_id, "date": entry.get("date")})
+                except GarminNotFoundError:
+                    # calendar-service can list an entry that workout-service has
+                    # already dropped (eventual-consistency phantom after a delete).
+                    # A 404 means the entry is already gone — the desired end state —
+                    # so record it and carry on rather than aborting the reschedule.
+                    phantom.append({"scheduleId": schedule_id, "date": entry.get("date")})
+
+        result = self.schedule_workout(workout_id, date)
+        new_schedule_id = None
+        if isinstance(result, dict):
+            new_schedule_id = result.get("workoutScheduleId") or result.get("id")
+
+        return {
+            "workout_id": workout_id,
+            "scheduled_date": date,
+            "new_schedule_id": new_schedule_id,
+            "removed_duplicates": removed,
+            "stale_phantom_entries": phantom,
+            "schedule_result": result,
+        }
+
     def update_workout(self, workout_id: int, workout_data: str | dict) -> Any:
         """
         Update an existing workout by ID via PUT request.
