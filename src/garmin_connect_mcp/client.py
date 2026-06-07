@@ -2,6 +2,7 @@
 
 import json as _json
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -50,81 +51,130 @@ class GarminAuthenticationError(GarminAPIError):
         )
 
 
-def init_garmin_client(config: GarminConfig) -> Garmin | None:
-    """
-    Initialize and authenticate Garmin client.
+# Module-level cache: the authenticated client is built once and reused across
+# every tool call. garth transparently refreshes the short-lived OAuth2 access
+# token using the long-lived refresh token, so a cached client keeps working for
+# days without re-login (and without ever triggering an MFA SMS).
+_cached_client: Garmin | None = None
+_client_lock = threading.Lock()
 
-    Follows the authentication pattern from the original garmin_mcp project:
-    1. Try token-based login first
-    2. Fall back to credential-based login with MFA support
-    3. Persist tokens for future use
+
+def clear_cached_client() -> None:
+    """Drop the cached client so the next call re-authenticates from scratch."""
+    global _cached_client
+    with _client_lock:
+        _cached_client = None
+
+
+def _is_auth_failure(err: Exception) -> bool:
+    """True only for genuine auth rejections (token truly dead), not transient errors.
+
+    A 429 rate-limit or a network/5xx blip must NOT be treated as an auth failure —
+    doing so is what cascaded into full credential logins and MFA-passcode spam.
+    """
+    s = str(err)
+    return any(marker in s for marker in ("401", "403", "Unauthorized", "Forbidden"))
+
+
+def _login_with_tokens(tokenstore: str) -> Garmin:
+    """Resume a session from persisted OAuth tokens. Raises on failure."""
+    token_path = Path(tokenstore)
+    if not (token_path.exists() and any(token_path.iterdir())):
+        raise FileNotFoundError("No tokens found")
+    garmin = Garmin()
+    garmin.login(tokenstore)
+    return garmin
+
+
+def _credential_login(config: GarminConfig, tokenstore: str) -> Garmin:
+    """Full email/password login, used only when saved tokens are truly dead.
+
+    MFA cannot be completed from a background MCP server (no stdin), so if Garmin
+    demands an MFA code we fail with a clear instruction instead of silently
+    triggering a passcode SMS and then blocking on input().
+    """
+    garmin = Garmin(config.garmin_email, config.garmin_password)
+    result = garmin.login()
+
+    if result and len(result) >= 2:
+        oauth1_token, _ = result
+        mfa_token = getattr(oauth1_token, "mfa_token", None)
+        if mfa_token:
+            raise GarminConnectAuthenticationError(
+                "Garmin requires an MFA code, which cannot be entered from the "
+                "background server. Run 'garmin-connect-mcp-auth' in a terminal to "
+                "re-authenticate, then retry."
+            )
+
+    garmin.garth.dump(tokenstore)
+    print(f"OAuth tokens saved to directory: {tokenstore}", file=sys.stderr)
+    Path(get_token_base64_path()).write_text(garmin.garth.dumps())
+    return garmin
+
+
+def init_garmin_client(config: GarminConfig, force_refresh: bool = False) -> Garmin | None:
+    """
+    Return an authenticated Garmin client, reusing a cached session when possible.
+
+    Strategy:
+    1. Reuse the cached client unless force_refresh is set (garth auto-refreshes
+       the access token via the refresh token, so no re-login/MFA is needed).
+    2. Otherwise resume from persisted OAuth tokens on disk.
+    3. Only fall back to a full credential login when the saved tokens are
+       genuinely rejected (401/403). Transient errors (429/network/5xx) return
+       None so the caller can surface a retryable error — they never trigger MFA.
 
     Args:
         config: Garmin configuration with credentials
+        force_refresh: Rebuild the client even if one is cached
 
     Returns:
-        Authenticated Garmin client or None on failure
+        Authenticated Garmin client, or None on transient/auth failure
     """
-    try:
+    global _cached_client
+
+    with _client_lock:
+        if _cached_client is not None and not force_refresh:
+            return _cached_client
+
         tokenstore = get_token_store()
 
-        # Try token-based login first
+        # Resume from saved tokens (the common path).
         try:
-            # Check if tokens exist
-            token_path = Path(tokenstore)
-            if token_path.exists() and any(token_path.iterdir()):
-                # Try to login with existing tokens
-                garmin = Garmin()
-                garmin.login(tokenstore)
-                print("Logged in using token data from directory.", file=sys.stderr)
-                return garmin
-            else:
-                raise FileNotFoundError("No tokens found")
-
-        except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError) as e:
-            # Token login failed, try credential login
-            print(f"Token login failed: {e}. Attempting credential-based login...", file=sys.stderr)
-
-            # Create Garmin client with credentials
-            garmin = Garmin(config.garmin_email, config.garmin_password)
-
-            # Attempt login
-            result = garmin.login()
-
-            # Check if MFA is needed
-            if result and len(result) >= 2:
-                oauth1_token, oauth2_token = result
-
-                # Check if MFA is required (oauth1_token will have mfa_token)
-                mfa_token = getattr(oauth1_token, "mfa_token", None)
-                if mfa_token:
-                    print("MFA required. Please enter your MFA code.", file=sys.stderr)
-                    mfa_code = input("MFA one-time code: ")
-
-                    # Resume login with MFA code
-                    garmin.resume_login(result, mfa_code)
-
-            # Save tokens for future use
-            garmin.garth.dump(tokenstore)
-            print(f"OAuth tokens saved to directory: {tokenstore}", file=sys.stderr)
-
-            # Also save base64 encoded tokens
-            token_base64_path = get_token_base64_path()
-            Path(token_base64_path).write_text(garmin.garth.dumps())
-            print(f"OAuth tokens encoded as base64: {token_base64_path}", file=sys.stderr)
-
+            garmin = _login_with_tokens(tokenstore)
+            print("Logged in using token data from directory.", file=sys.stderr)
+            _cached_client = garmin
             return garmin
+        except FileNotFoundError as e:
+            # No tokens at all → first-time credential login is legitimate.
+            print(f"No saved tokens: {e}. Attempting credential login...", file=sys.stderr)
+        except (GarthHTTPError, GarminConnectAuthenticationError) as e:
+            if not _is_auth_failure(e):
+                # Transient: the saved tokens are almost certainly still valid.
+                # Do NOT re-auth (that's the MFA-storm path). Fail retryably.
+                print(
+                    f"Transient token-login error (not re-authing): {e}", file=sys.stderr
+                )
+                return None
+            print(
+                f"Saved tokens rejected ({e}). Attempting credential login...",
+                file=sys.stderr,
+            )
 
-    except GarminConnectAuthenticationError as err:
-        print(f"Authentication error: {err}", file=sys.stderr)
-        return None
+        # Genuine credential login: first run, or saved tokens truly dead.
+        try:
+            garmin = _credential_login(config, tokenstore)
+            _cached_client = garmin
+            return garmin
+        except GarminConnectAuthenticationError as err:
+            print(f"Authentication error: {err}", file=sys.stderr)
+            return None
+        except Exception as err:
+            print(f"Unexpected error during login: {err}", file=sys.stderr)
+            import traceback
 
-    except Exception as err:
-        print(f"Unexpected error during login: {err}", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc(file=sys.stderr)
-        return None
+            traceback.print_exc(file=sys.stderr)
+            return None
 
 
 class GarminClientWrapper:
