@@ -9,8 +9,8 @@ from ..response_builder import ResponseBuilder
 
 
 async def manage_workouts(
-    action: Annotated[str, "Action: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'schedule', 'reschedule', 'unschedule'"],
-    workout_id: Annotated[int | None, "Workout ID (for get/download/update/schedule actions)"] = None,
+    action: Annotated[str, "Action: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'schedule', 'reschedule', 'unschedule', 'delete'"],
+    workout_id: Annotated[int | None, "Workout ID (for get/download/update/schedule/delete actions)"] = None,
     workout_data: Annotated[str | None, "Workout data (for upload/update actions)"] = None,
     schedule_date: Annotated[str | None, "Date to schedule workout (YYYY-MM-DD format, for schedule action)"] = None,
     schedule_id: Annotated[int | None, "Workout schedule ID (for unschedule action — returned by schedule action as workoutScheduleId)"] = None,
@@ -35,6 +35,9 @@ async def manage_workouts(
       that workout in the window (duplicate-proof — prefer this over schedule when
       a workout may already be on the calendar). Provide workout_id and schedule_date.
     - unschedule: Remove a scheduled workout from the calendar (provide schedule_id)
+    - delete: Permanently delete a workout from the library (provide workout_id).
+      Distinct from unschedule, which only removes a calendar instance. If the
+      workout is currently scheduled, unschedule it first.
     """
     assert ctx is not None
     try:
@@ -199,11 +202,26 @@ async def manage_workouts(
                 metadata={"action": "unschedule", "schedule_id": schedule_id},
             )
 
+        elif action == "delete":
+            if workout_id is None:
+                return ResponseBuilder.build_error_response(
+                    "Workout ID required for delete action",
+                    "invalid_parameters",
+                    ["Provide workout_id parameter"],
+                )
+
+            result = client.delete_workout(workout_id)
+            return ResponseBuilder.build_response(
+                data={"result": result},
+                analysis={"insights": [f"Workout {workout_id} permanently deleted from the library"]},
+                metadata={"action": "delete", "workout_id": workout_id},
+            )
+
         else:
             return ResponseBuilder.build_error_response(
                 f"Invalid action: {action}",
                 "invalid_parameters",
-                ["Valid actions: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'schedule', 'reschedule', 'unschedule'"],
+                ["Valid actions: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'schedule', 'reschedule', 'unschedule', 'delete'"],
             )
 
     except GarminAPIError as e:

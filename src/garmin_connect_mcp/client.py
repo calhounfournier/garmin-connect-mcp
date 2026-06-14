@@ -230,6 +230,34 @@ class GarminClientWrapper:
         except Exception as e:
             raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
 
+    def delete_workout(self, workout_id: int) -> Any:
+        """
+        Permanently delete a workout from the Garmin library via DELETE request.
+
+        Distinct from unschedule_workout: this removes the workout itself from the
+        library, not merely a calendar instance. If the workout is currently
+        scheduled, unschedule it first (the calendar entry references the workout).
+
+        Args:
+            workout_id: The library workout id (from get_workouts / the 'list' action).
+        """
+        try:
+            url = f"/workout-service/workout/{workout_id}"
+            self.client.garth.delete("connectapi", url, api=True)
+            return {"status": "ok", "workout_id": workout_id}
+        except GarthHTTPError as e:
+            error_str = str(e)
+            if "429" in error_str:
+                raise GarminRateLimitError(original_error=e) from e
+            elif "404" in error_str:
+                raise GarminNotFoundError("Workout", original_error=e) from e
+            elif "401" in error_str or "403" in error_str:
+                raise GarminAuthenticationError(original_error=e) from e
+            else:
+                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+        except Exception as e:
+            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+
     def get_scheduled_workouts(self, start_date: str, end_date: str) -> list[dict]:
         """
         List workouts scheduled on the Garmin calendar within a date range.
