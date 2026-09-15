@@ -10,7 +10,12 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from .auth import load_config, validate_credentials
-from .client import GarminClientWrapper, init_garmin_client
+from .client import (
+    GarminAuthenticationError,
+    GarminClientWrapper,
+    clear_cached_client,
+    init_garmin_client,
+)
 
 
 class ConfigMiddleware(Middleware):
@@ -35,10 +40,14 @@ class ConfigMiddleware(Middleware):
                 "Please run 'garmin-connect-mcp-auth' to set up authentication."
             )
 
-        # Initialize Garmin client
+        # Get the cached Garmin client (authenticated once, reused across calls).
         client = init_garmin_client(config)
         if client is None:
-            raise ToolError("Failed to initialize Garmin client. Please check your credentials.")
+            raise ToolError(
+                "Garmin client unavailable. This is usually a transient error "
+                "(rate limit or network) — wait a moment and retry. If it persists, "
+                "run 'garmin-connect-mcp-auth' in a terminal to re-authenticate."
+            )
 
         client_wrapper = GarminClientWrapper(client)
 
@@ -46,5 +55,10 @@ class ConfigMiddleware(Middleware):
         if context.fastmcp_context:
             context.fastmcp_context.set_state("client", client_wrapper)
 
-        # Continue to the tool execution
-        return await call_next(context)
+        # Continue to the tool execution. If the session went genuinely stale
+        # mid-call, drop the cache so the next call rebuilds it from disk.
+        try:
+            return await call_next(context)
+        except GarminAuthenticationError:
+            clear_cached_client()
+            raise
