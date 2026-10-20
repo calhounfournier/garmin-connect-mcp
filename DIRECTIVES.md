@@ -12,6 +12,25 @@ _(none)_
 
 ## Processed
 
+### D-003 — Port to garminconnect 0.3.19
+
+**Processed:** 2026-10-20
+
+**Source:** Charles, 2026-10-20: « do the 0.3.19 port now », after asking why the morning fix had pinned backward (« What if Garmin deprecates the old format? »).
+
+**Scope:** `pyproject.toml`, `uv.lock`, `Dockerfile`, `src/garmin_connect_mcp/client.py`, `scripts/setup_auth.py`, `tools/training.py`, `tools/activities.py`, `server.py`, README/CLAUDE.md, tests; in memoire, `.claude/scripts/{gather-brief-data,health-snapshot,schedule-swimming}.py`.
+
+**Outcome:** `garminconnect==0.3.19` pinned exactly (Python floor raised to 3.12, which 0.3.19 requires; garth gone). The 7 hand-rolled garth calls are replaced by the library's own `schedule_workout`, `unschedule_workout`, `delete_workout`, `update_workout` and `get_scheduled_workouts(year, month)`. 0.3.x exceptions (`GarminConnectConnectionError` with `.response`, `NotFound`, `TooManyRequests`, `Authentication`) map onto the server's error types in one `_translate_error`. The D-002 inversion is finished: credential login only on a positively empty store; legacy-format or rejected tokens return `None`; the MFA prompt raises `GarminMFARequiredError`, a `GarminConnectAuthenticationError` subclass, because garminconnect's strategy loop stops on that type and tries the next strategy (another passcode) on anything else. `get_training_effect` now reads the activity summary (`trainingEffect`, `anaerobicTrainingEffect`, messages, label, `activityTrainingLoad`, field names probed live); fitness age uses `get_fitnessage_data`; `get_activity_social` is removed (no endpoint in any release). `garmin-connect-mcp-auth` now performs the login with the MFA code typed at the terminal. Commits `2562ec1` (tests, RED by import failure) and `249e025` (port).
+
+**Verification:** 142 passed on the Mac and on cf-server. Guard mutation: re-allowing a credential login on rejected tokens fails `test_rejected_tokens_never_credential_log_in`. A test asserts every `safe_call` name exists on the installed library. Live, credentials blanked, on both machines: calendar 10-19→10-26, latest activity's training effect, fitness age, sleep. Live write test on the Mac with a throwaway workout (upload, schedule 12-30, reschedule to 12-29 leaving one entry, update name, unschedule, delete, 404 confirmed, no calendar leftovers). All three vault scripts run on 0.3.19; the swim script ran with its writes stubbed and found Oct 21, 23, 26.
+
+**Notable deviations / surprises:**
+- Mac needed its own login (one MFA code from Charles, 09:55). Its store held only March 2026 legacy tokens. The token file is not shared between machines: the refresh token is opaque and rotation behaviour is unknown.
+- The first two login strategies returned 429 on the Mac before the third reached MFA; one passcode email in total.
+- `schedule-swimming.py` was querying the wrong month: it passed a 1-indexed month to the 0-indexed calendar endpoint. The native call fixes it.
+- Not pushed: `origin` push is still open from D-002 (« Push where? »). Both machines run the branch from their working tree; cf-server got it by git bundle.
+- Running MCP processes keep the old code until reconnect. Legacy oauth files stay in `~/.garminconnect` until they have.
+
 ### D-002 — An unreadable token store must never trigger a credential login
 
 **Processed:** 2026-10-20
