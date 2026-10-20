@@ -41,6 +41,23 @@ class GarminNotFoundError(GarminAPIError):
         )
 
 
+class GarminTokenFormatError(GarminAPIError):
+    """Token store is non-empty but unreadable by the installed garth version.
+
+    Tokens exist, so a credential login is the wrong response: it would send
+    Charles an MFA passcode on every tool call. Surfaced as retryable instead.
+    """
+
+    def __init__(self, tokenstore: str, original_error: Exception | None = None):
+        super().__init__(
+            f"Token store {tokenstore} is non-empty but unreadable by the installed "
+            "garth version (format mismatch). Not attempting a credential login. "
+            "Re-authenticate with 'garmin-connect-mcp-auth' or point GARMINTOKENS "
+            "at a token store this version can read.",
+            original_error=original_error,
+        )
+
+
 class GarminAuthenticationError(GarminAPIError):
     """Exception raised when authentication fails (HTTP 401/403)."""
 
@@ -82,7 +99,12 @@ def _login_with_tokens(tokenstore: str) -> Garmin:
     if not (token_path.exists() and any(token_path.iterdir())):
         raise FileNotFoundError("No tokens found")
     garmin = Garmin()
-    garmin.login(tokenstore)
+    try:
+        garmin.login(tokenstore)
+    except FileNotFoundError as e:
+        # The directory has files, so tokens were provisioned — garth just can't
+        # read this layout. Distinct from "no tokens", which may credential-login.
+        raise GarminTokenFormatError(tokenstore, original_error=e) from e
     return garmin
 
 
@@ -145,6 +167,11 @@ def init_garmin_client(config: GarminConfig, force_refresh: bool = False) -> Gar
             print("Logged in using token data from directory.", file=sys.stderr)
             _cached_client = garmin
             return garmin
+        except GarminTokenFormatError as e:
+            # Tokens exist but this garth can't read them. A credential login here
+            # fires an MFA passcode on every single tool call.
+            print(f"{e.message}", file=sys.stderr)
+            return None
         except FileNotFoundError as e:
             # No tokens at all → first-time credential login is legitimate.
             print(f"No saved tokens: {e}. Attempting credential login...", file=sys.stderr)

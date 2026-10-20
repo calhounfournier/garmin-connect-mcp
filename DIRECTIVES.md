@@ -12,6 +12,30 @@ _(none)_
 
 ## Processed
 
+### D-002 — An unreadable token store must never trigger a credential login
+
+**Processed:** 2026-10-20
+
+**Source:** Live incident. Charles asked to move leg day; every `manage_workouts` call returned "Garmin client unavailable." Four retries sent him five Garmin MFA passcode emails at 06:17–06:18, which he caught via a screenshot of his inbox.
+
+**Scope:** `src/garmin_connect_mcp/client.py`, `tests/test_token_format_guard.py`.
+
+**Outcome:** Root cause was a version skew, not a dead token. The 2026-10-19 18:07 morning-brief fix re-authenticated with garminconnect 0.3.19, which writes a single `garmin_tokens.json` (`di_token`/`di_refresh_token`/`di_client_id`) into `~/.garminconnect`. This repo's venv pins garminconnect 0.2.38 / garth 0.5.21, which still expect `oauth1_token.json` + `oauth2_token.json`. `_login_with_tokens` passed its own non-empty-directory check, then `Garmin.login()` raised `FileNotFoundError` for the missing `oauth1_token.json` — and `init_garmin_client` caught that as "no tokens at all → first-time credential login is legitimate." So every tool call did a full email/password login and Garmin mailed a passcode.
+
+Added `GarminTokenFormatError`. `_login_with_tokens` now wraps the inner `FileNotFoundError` in it, distinguishing "directory has token files this garth can't parse" from "directory is empty." `init_garmin_client` catches it ahead of the `FileNotFoundError` branch and returns `None` (retryable) without ever reaching `_credential_login`. A genuinely empty store still credential-logs in.
+
+Also pinned this server's token store via `env.GARMINTOKENS` → `/Users/admin/.garminconnect-mcp` in `~/.claude.json` (backup `.claude.json.bak-2026-10-20-garmin`), seeded from `~/.garminconnect.bak-2026-10-19`. Those oauth1/oauth2 tokens are from 2026-06-07 and still authenticate. The brief scripts keep using `~/.garminconnect` on the new format, so both work.
+
+**Verification:** 3 new tests; full suite 79 passed. RED proven precisely by reverting only the `return None` guard (keeping the exception class, so the failure is behavioural not a collection error) — `mock_credential.assert_not_called()` failed, confirming the credential login fired without the guard. Live probe against the real broken store with credentials blanked returns `None` and logs the format-mismatch message. End-to-end login against the pinned store returns an authenticated client.
+
+**Notable deviations / surprises:**
+- This is the second MFA-spam incident in this repo — `9855787` ("stop transient errors triggering MFA") hardened the 429/network path. That fix guarded transient HTTP errors but not a token-format mismatch, which arrives as `FileNotFoundError`. The guard now covers both shapes.
+- Both failures share one design flaw: credential login is the default fallback for *any* unexplained resume failure. The safer inversion is to credential-login only on a positively-identified empty store. Partially done here; worth finishing.
+- The deeper skew is unresolved: this venv is two minor versions behind the one the brief scripts use. Two token stores is a workaround, not an alignment. Upgrading garminconnect to 0.3.x touches every tool and was not attempted mid-incident.
+- Credentials sit in the repo's plaintext `.env`, which is what makes a stray credential login possible at all.
+
+---
+
 ### D-001 — Add a `delete` action to `manage_workouts`
 
 **Processed:** 2026-06-14
