@@ -1,42 +1,31 @@
 """Tests for calendar-aware workout scheduling on GarminClientWrapper.
 
-Covers the calendar-service-backed ``get_scheduled_workouts`` (0-indexed month,
-date-range filtering, workout-only, multi-month spanning) and the duplicate-proof
+Covers ``get_scheduled_workouts`` (built on garminconnect's month-based
+``get_scheduled_workouts(year, month)``: date-range filtering, workout-only,
+multi-month spanning, grid-overflow dedupe) and the duplicate-proof
 ``reschedule_workout`` (remove existing matching entries, then schedule).
 """
 
 from unittest.mock import MagicMock
 
 import pytest
-
-from garth.exc import GarthHTTPError
-from requests import HTTPError
+from garminconnect import GarminConnectNotFoundError
 
 from garmin_connect_mcp.client import GarminAPIError, GarminClientWrapper
 
 
-def _resp(payload):
-    """A fake garth HTTP response whose .json() returns ``payload``."""
-    r = MagicMock()
-    r.json.return_value = payload
-    return r
-
-
 def _wrapper_with_months(month_payloads):
     """
-    Build a wrapper whose garth.get returns a payload chosen by the month in the
-    request URL. ``month_payloads`` maps a URL substring (e.g. "/month/5") to the
-    calendar-service payload to return for that month.
+    Build a wrapper whose client.get_scheduled_workouts returns a payload chosen
+    by (year, month). ``month_payloads`` maps a 1-indexed (year, month) tuple to the
+    calendar payload for that month.
     """
     client = MagicMock()
 
-    def get_side(_connectapi, url, api=True):
-        for key, payload in month_payloads.items():
-            if key in url:
-                return _resp(payload)
-        return _resp({"calendarItems": []})
+    def get_side(year, month):
+        return month_payloads.get((year, month), {"calendarItems": []})
 
-    client.garth.get.side_effect = get_side
+    client.get_scheduled_workouts.side_effect = get_side
     return GarminClientWrapper(client), client
 
 
@@ -52,7 +41,7 @@ def test_get_scheduled_filters_by_type_and_range():
             {"itemType": "activity", "id": 444, "workoutId": None, "title": "Swim", "date": "2026-06-03"},
         ]
     }
-    wrapper, _ = _wrapper_with_months({"/month/5": payload})
+    wrapper, _ = _wrapper_with_months({(2026, 6): payload})
 
     result = wrapper.get_scheduled_workouts("2026-06-01", "2026-06-07")
 
@@ -62,14 +51,13 @@ def test_get_scheduled_filters_by_type_and_range():
     ]
 
 
-def test_get_scheduled_month_is_zero_indexed():
-    """June (month 6) must hit the calendar-service path /month/5."""
-    wrapper, client = _wrapper_with_months({"/month/5": {"calendarItems": []}})
+def test_get_scheduled_passes_one_indexed_month():
+    """garminconnect does the 0-index shift itself; June must be requested as month 6."""
+    wrapper, client = _wrapper_with_months({})
 
     wrapper.get_scheduled_workouts("2026-06-01", "2026-06-07")
 
-    called_urls = [call.args[1] for call in client.garth.get.call_args_list]
-    assert called_urls == ["/calendar-service/year/2026/month/5"]
+    assert [c.args for c in client.get_scheduled_workouts.call_args_list] == [(2026, 6)]
 
 
 def test_get_scheduled_spans_multiple_months_sorted():
@@ -80,23 +68,32 @@ def test_get_scheduled_spans_multiple_months_sorted():
     june = {"calendarItems": [
         {"itemType": "workout", "id": 2, "workoutId": 92, "title": "June start", "date": "2026-06-01"},
     ]}
-    wrapper, client = _wrapper_with_months({"/month/4": may, "/month/5": june})
+    wrapper, client = _wrapper_with_months({(2026, 5): may, (2026, 6): june})
 
     result = wrapper.get_scheduled_workouts("2026-05-30", "2026-06-02")
 
     assert [r["date"] for r in result] == ["2026-05-31", "2026-06-01"]
-    called_urls = sorted(call.args[1] for call in client.garth.get.call_args_list)
-    assert called_urls == [
-        "/calendar-service/year/2026/month/4",
-        "/calendar-service/year/2026/month/5",
+    assert sorted(c.args for c in client.get_scheduled_workouts.call_args_list) == [
+        (2026, 5),
+        (2026, 6),
+    ]
+
+
+def test_get_scheduled_spans_year_boundary():
+    """December → January rolls the year forward."""
+    wrapper, client = _wrapper_with_months({})
+
+    wrapper.get_scheduled_workouts("2026-12-28", "2027-01-03")
+
+    assert [c.args for c in client.get_scheduled_workouts.call_args_list] == [
+        (2026, 12),
+        (2027, 1),
     ]
 
 
 def test_get_scheduled_dedupes_grid_overflow():
-    """calendar-service month payloads include adjacent-month grid-overflow days,
-    so a boundary date appears in two months. The same scheduleId must be returned
-    once, not twice."""
-    # June 2 appears in BOTH the May (month/4) and June (month/5) payloads.
+    """Month payloads include adjacent-month grid-overflow days, so a boundary date
+    appears in two months. The same scheduleId must be returned once, not twice."""
     may = {"calendarItems": [
         {"itemType": "workout", "id": 700, "workoutId": 70, "title": "May28", "date": "2026-05-28"},
         {"itemType": "workout", "id": 800, "workoutId": 80, "title": "Push", "date": "2026-06-02"},
@@ -104,7 +101,7 @@ def test_get_scheduled_dedupes_grid_overflow():
     june = {"calendarItems": [
         {"itemType": "workout", "id": 800, "workoutId": 80, "title": "Push", "date": "2026-06-02"},
     ]}
-    wrapper, _ = _wrapper_with_months({"/month/4": may, "/month/5": june})
+    wrapper, _ = _wrapper_with_months({(2026, 5): may, (2026, 6): june})
 
     result = wrapper.get_scheduled_workouts("2026-05-19", "2026-06-23")
 
@@ -122,19 +119,19 @@ def test_reschedule_grid_overflow_no_double_unschedule():
     june = {"calendarItems": [
         {"itemType": "workout", "id": 800, "workoutId": 80, "title": "Push", "date": "2026-06-02"},
     ]}
-    wrapper, client = _wrapper_with_months({"/month/4": may, "/month/5": june})
-    client.garth.post.return_value = _resp({"workoutScheduleId": 8080})
+    wrapper, client = _wrapper_with_months({(2026, 5): may, (2026, 6): june})
+    client.schedule_workout.return_value = {"workoutScheduleId": 8080}
 
     result = wrapper.reschedule_workout(80, "2026-06-02")
 
-    assert client.garth.delete.call_count == 1  # not 2
+    assert client.unschedule_workout.call_count == 1  # not 2
     assert result["removed_duplicates"] == [{"scheduleId": 800, "date": "2026-06-02"}]
     assert result["stale_phantom_entries"] == []
 
 
 def test_get_scheduled_handles_empty_calendaritems():
     """A month with no calendarItems key returns nothing, no error."""
-    wrapper, _ = _wrapper_with_months({"/month/5": {}})
+    wrapper, _ = _wrapper_with_months({(2026, 6): {}})
     assert wrapper.get_scheduled_workouts("2026-06-01", "2026-06-07") == []
 
 
@@ -145,18 +142,15 @@ def test_reschedule_removes_matching_then_schedules():
         {"itemType": "workout", "id": 5001, "workoutId": 11, "title": "Push", "date": "2026-06-03"},
         {"itemType": "workout", "id": 5002, "workoutId": 22, "title": "Legs", "date": "2026-06-05"},
     ]}
-    wrapper, client = _wrapper_with_months({"/month/5": payload})
-    client.garth.post.return_value = _resp({"workoutScheduleId": 6001})
+    wrapper, client = _wrapper_with_months({(2026, 6): payload})
+    client.schedule_workout.return_value = {"workoutScheduleId": 6001}
 
     result = wrapper.reschedule_workout(11, "2026-06-02")
 
     # exactly one unschedule, for the stale Push entry only
-    assert client.garth.delete.call_count == 1
-    assert "/workout-service/schedule/5001" in client.garth.delete.call_args.args[1]
+    client.unschedule_workout.assert_called_once_with(5001)
     # scheduled to the target date
-    post_url = client.garth.post.call_args.args[1]
-    assert "/workout-service/schedule/11" in post_url
-    assert client.garth.post.call_args.kwargs["json"] == {"date": "2026-06-02"}
+    client.schedule_workout.assert_called_once_with(11, "2026-06-02")
     # return payload reflects the cleanup + new id
     assert result["scheduled_date"] == "2026-06-02"
     assert result["new_schedule_id"] == 6001
@@ -165,12 +159,12 @@ def test_reschedule_removes_matching_then_schedules():
 
 def test_reschedule_no_existing_entries():
     """With nothing on the calendar, reschedule just schedules — no unschedule calls."""
-    wrapper, client = _wrapper_with_months({"/month/5": {"calendarItems": []}})
-    client.garth.post.return_value = _resp({"workoutScheduleId": 7001})
+    wrapper, client = _wrapper_with_months({})
+    client.schedule_workout.return_value = {"workoutScheduleId": 7001}
 
     result = wrapper.reschedule_workout(11, "2026-06-02")
 
-    assert client.garth.delete.call_count == 0
+    client.unschedule_workout.assert_not_called()
     assert result["removed_duplicates"] == []
     assert result["new_schedule_id"] == 7001
 
@@ -181,12 +175,12 @@ def test_reschedule_dedups_multiple_stale_entries():
         {"itemType": "workout", "id": 8001, "workoutId": 11, "title": "Push", "date": "2026-06-03"},
         {"itemType": "workout", "id": 8002, "workoutId": 11, "title": "Push", "date": "2026-06-04"},
     ]}
-    wrapper, client = _wrapper_with_months({"/month/5": payload})
-    client.garth.post.return_value = _resp({"workoutScheduleId": 9001})
+    wrapper, client = _wrapper_with_months({(2026, 6): payload})
+    client.schedule_workout.return_value = {"workoutScheduleId": 9001}
 
     result = wrapper.reschedule_workout(11, "2026-06-02")
 
-    assert client.garth.delete.call_count == 2
+    assert client.unschedule_workout.call_count == 2
     assert {r["scheduleId"] for r in result["removed_duplicates"]} == {8001, 8002}
 
 
@@ -197,13 +191,11 @@ def test_reschedule_tolerates_phantom_entry():
     payload = {"calendarItems": [
         {"itemType": "workout", "id": 4040, "workoutId": 11, "title": "Push", "date": "2026-06-03"},
     ]}
-    wrapper, client = _wrapper_with_months({"/month/5": payload})
-    # garth raises a 404; unschedule_workout maps it to GarminNotFoundError, which
-    # reschedule_workout must swallow as "already gone".
-    client.garth.delete.side_effect = GarthHTTPError(
-        "Error in request", HTTPError("404 Client Error: Not Found")
-    )
-    client.garth.post.return_value = _resp({"workoutScheduleId": 4242})
+    wrapper, client = _wrapper_with_months({(2026, 6): payload})
+    # garminconnect raises a 404 as GarminConnectNotFoundError; unschedule_workout
+    # maps it to GarminNotFoundError, which reschedule_workout swallows as "already gone".
+    client.unschedule_workout.side_effect = GarminConnectNotFoundError("API Error 404")
+    client.schedule_workout.return_value = {"workoutScheduleId": 4242}
 
     result = wrapper.reschedule_workout(11, "2026-06-02")
 
@@ -218,5 +210,5 @@ def test_reschedule_invalid_date_raises():
     wrapper, client = _wrapper_with_months({})
     with pytest.raises(GarminAPIError):
         wrapper.reschedule_workout(11, "June 2 2026")
-    client.garth.get.assert_not_called()
-    client.garth.post.assert_not_called()
+    client.get_scheduled_workouts.assert_not_called()
+    client.schedule_workout.assert_not_called()
