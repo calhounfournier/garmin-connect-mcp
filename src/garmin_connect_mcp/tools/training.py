@@ -293,7 +293,7 @@ async def get_performance_metrics(
             # Fitness age
             if include_fitness_age:
                 try:
-                    fitness_age = client.safe_call("get_fitness_age", query_date)
+                    fitness_age = client.safe_call("get_fitnessage_data", query_date)
                     metrics_data["fitness_age"] = fitness_age
                 except Exception:
                     metrics_data["fitness_age"] = None
@@ -365,7 +365,18 @@ async def get_training_effect(
 
         # Pattern 1: Training effect for activity
         if activity_id is not None:
-            effect = client.safe_call("get_training_effect", activity_id)
+            # garminconnect has no training-effect endpoint; the numbers live on
+            # the activity summary.
+            activity = client.safe_call("get_activity", activity_id) or {}
+            summary = activity.get("summaryDTO") or {}
+            effect = {
+                "aerobic": summary.get("trainingEffect"),
+                "anaerobic": summary.get("anaerobicTrainingEffect"),
+                "aerobic_message": summary.get("aerobicTrainingEffectMessage"),
+                "anaerobic_message": summary.get("anaerobicTrainingEffectMessage"),
+                "label": summary.get("trainingEffectLabel"),
+                "training_load": summary.get("activityTrainingLoad"),
+            }
 
             return ResponseBuilder.build_response(
                 data={"training_effect": effect},

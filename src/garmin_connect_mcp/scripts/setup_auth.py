@@ -1,8 +1,18 @@
-"""Interactive authentication setup script for Garmin Connect MCP."""
+"""Interactive authentication setup script for Garmin Connect MCP.
 
+The background server never completes a login that needs MFA, so this is the one
+place a fresh token store gets created: credentials are saved to .env, then a full
+login runs here with the MFA code typed at the terminal, and garminconnect writes
+garmin_tokens.json into the token store.
+"""
+
+import sys
 from pathlib import Path
 
 from dotenv import set_key
+from garminconnect import Garmin
+
+from ..auth import get_token_store, load_config, validate_credentials
 
 
 def main():
@@ -11,44 +21,44 @@ def main():
     print("Garmin Connect MCP - Authentication Setup")
     print("=" * 60)
     print()
-    print("This script will help you set up authentication with Garmin Connect.")
-    print()
 
-    # Get Garmin credentials
-    print("Enter your Garmin Connect credentials:")
-    print("-" * 60)
-    email = input("Email: ").strip()
-    password = input("Password: ").strip()
+    config = load_config()
+    if validate_credentials(config) and input(
+        f"Use saved credentials for {config.garmin_email}? [Y/n] "
+    ).strip().lower() in ("", "y", "yes"):
+        email, password = config.garmin_email, config.garmin_password
+    else:
+        print("Enter your Garmin Connect credentials:")
+        print("-" * 60)
+        email = input("Email: ").strip()
+        password = input("Password: ").strip()
 
-    if not email or not password:
-        print("\nError: Email and password are required.")
-        return
+        if not email or not password:
+            print("\nError: Email and password are required.")
+            return
 
-    # Save to .env file
-    env_path = Path.cwd() / ".env"
+        env_path = Path.cwd() / ".env"
+        if not env_path.exists():
+            env_path.touch()
+        set_key(str(env_path), "GARMIN_EMAIL", email)
+        set_key(str(env_path), "GARMIN_PASSWORD", password)
+        print("\n✓ Credentials saved to .env")
 
-    if not env_path.exists():
-        env_path.touch()
+    tokenstore = get_token_store()
+    print(f"\nLogging in to Garmin Connect (tokens go to {tokenstore})...")
+    garmin = Garmin(email, password, prompt_mfa=lambda: input("MFA code: ").strip())
+    try:
+        garmin.login(tokenstore)
+    except Exception as e:
+        print(f"\nLogin failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    set_key(str(env_path), "GARMIN_EMAIL", email)
-    set_key(str(env_path), "GARMIN_PASSWORD", password)
-
-    print()
-    print("✓ Success! Credentials have been saved to .env")
     print()
     print("=" * 60)
-    print("Setup Complete!")
+    print(f"✓ Logged in. Tokens saved to {tokenstore}/garmin_tokens.json")
     print("=" * 60)
     print()
-    print("Authentication will be performed automatically when you")
-    print("first run the Garmin Connect MCP server.")
-    print()
-    print("If you have two-factor authentication enabled, you will be")
-    print("prompted for your MFA code on first login.")
-    print()
-    print("You can now use the Garmin Connect MCP server:")
-    print("  uv run garmin-connect-mcp")
-    print()
+    print("Reconnect the MCP server (/mcp → garmin → reconnect) to pick them up.")
 
 
 if __name__ == "__main__":

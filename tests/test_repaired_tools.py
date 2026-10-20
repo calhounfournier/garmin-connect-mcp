@@ -43,7 +43,9 @@ async def test_training_effect_reads_activity_summary():
     client = _real_spec_client()
     client.get_activity.return_value = {"activityId": 9, "summaryDTO": SUMMARY}
 
-    out = json.loads(await get_training_effect(activity_id=9, ctx=_ctx(GarminClientWrapper(client))))
+    out = json.loads(
+        await get_training_effect(activity_id=9, ctx=_ctx(GarminClientWrapper(client)))
+    )
 
     client.get_activity.assert_called_once_with(9)
     effect = out["data"]["training_effect"]

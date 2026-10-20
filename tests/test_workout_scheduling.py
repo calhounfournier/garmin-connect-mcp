@@ -33,12 +33,36 @@ def test_get_scheduled_filters_by_type_and_range():
     """Only workout items within the inclusive range are returned, with mapped fields."""
     payload = {
         "calendarItems": [
-            {"itemType": "workout", "id": 111, "workoutId": 11, "title": "Push", "date": "2026-06-02"},
-            {"itemType": "workout", "id": 222, "workoutId": 22, "title": "Legs", "date": "2026-06-05"},
+            {
+                "itemType": "workout",
+                "id": 111,
+                "workoutId": 11,
+                "title": "Push",
+                "date": "2026-06-02",
+            },
+            {
+                "itemType": "workout",
+                "id": 222,
+                "workoutId": 22,
+                "title": "Legs",
+                "date": "2026-06-05",
+            },
             # out of range (before start)
-            {"itemType": "workout", "id": 333, "workoutId": 33, "title": "Old", "date": "2026-05-30"},
+            {
+                "itemType": "workout",
+                "id": 333,
+                "workoutId": 33,
+                "title": "Old",
+                "date": "2026-05-30",
+            },
             # wrong type — an activity, not a scheduled workout
-            {"itemType": "activity", "id": 444, "workoutId": None, "title": "Swim", "date": "2026-06-03"},
+            {
+                "itemType": "activity",
+                "id": 444,
+                "workoutId": None,
+                "title": "Swim",
+                "date": "2026-06-03",
+            },
         ]
     }
     wrapper, _ = _wrapper_with_months({(2026, 6): payload})
@@ -62,12 +86,28 @@ def test_get_scheduled_passes_one_indexed_month():
 
 def test_get_scheduled_spans_multiple_months_sorted():
     """A range crossing a month boundary queries both months and merges sorted by date."""
-    may = {"calendarItems": [
-        {"itemType": "workout", "id": 1, "workoutId": 91, "title": "May end", "date": "2026-05-31"},
-    ]}
-    june = {"calendarItems": [
-        {"itemType": "workout", "id": 2, "workoutId": 92, "title": "June start", "date": "2026-06-01"},
-    ]}
+    may = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 1,
+                "workoutId": 91,
+                "title": "May end",
+                "date": "2026-05-31",
+            },
+        ]
+    }
+    june = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 2,
+                "workoutId": 92,
+                "title": "June start",
+                "date": "2026-06-01",
+            },
+        ]
+    }
     wrapper, client = _wrapper_with_months({(2026, 5): may, (2026, 6): june})
 
     result = wrapper.get_scheduled_workouts("2026-05-30", "2026-06-02")
@@ -94,13 +134,35 @@ def test_get_scheduled_spans_year_boundary():
 def test_get_scheduled_dedupes_grid_overflow():
     """Month payloads include adjacent-month grid-overflow days, so a boundary date
     appears in two months. The same scheduleId must be returned once, not twice."""
-    may = {"calendarItems": [
-        {"itemType": "workout", "id": 700, "workoutId": 70, "title": "May28", "date": "2026-05-28"},
-        {"itemType": "workout", "id": 800, "workoutId": 80, "title": "Push", "date": "2026-06-02"},
-    ]}
-    june = {"calendarItems": [
-        {"itemType": "workout", "id": 800, "workoutId": 80, "title": "Push", "date": "2026-06-02"},
-    ]}
+    may = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 700,
+                "workoutId": 70,
+                "title": "May28",
+                "date": "2026-05-28",
+            },
+            {
+                "itemType": "workout",
+                "id": 800,
+                "workoutId": 80,
+                "title": "Push",
+                "date": "2026-06-02",
+            },
+        ]
+    }
+    june = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 800,
+                "workoutId": 80,
+                "title": "Push",
+                "date": "2026-06-02",
+            },
+        ]
+    }
     wrapper, _ = _wrapper_with_months({(2026, 5): may, (2026, 6): june})
 
     result = wrapper.get_scheduled_workouts("2026-05-19", "2026-06-23")
@@ -113,12 +175,28 @@ def test_get_scheduled_dedupes_grid_overflow():
 def test_reschedule_grid_overflow_no_double_unschedule():
     """A boundary-date duplicate from grid overflow must not cause the same entry to
     be unscheduled twice (which would 404 the second time and mislabel it phantom)."""
-    may = {"calendarItems": [
-        {"itemType": "workout", "id": 800, "workoutId": 80, "title": "Push", "date": "2026-06-02"},
-    ]}
-    june = {"calendarItems": [
-        {"itemType": "workout", "id": 800, "workoutId": 80, "title": "Push", "date": "2026-06-02"},
-    ]}
+    may = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 800,
+                "workoutId": 80,
+                "title": "Push",
+                "date": "2026-06-02",
+            },
+        ]
+    }
+    june = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 800,
+                "workoutId": 80,
+                "title": "Push",
+                "date": "2026-06-02",
+            },
+        ]
+    }
     wrapper, client = _wrapper_with_months({(2026, 5): may, (2026, 6): june})
     client.schedule_workout.return_value = {"workoutScheduleId": 8080}
 
@@ -138,10 +216,24 @@ def test_get_scheduled_handles_empty_calendaritems():
 def test_reschedule_removes_matching_then_schedules():
     """Reschedule unschedules only the same-workout stale entry, then schedules the target."""
     # Push (workoutId 11) is wrongly on 06-03; Legs (22) is unrelated and must be left alone.
-    payload = {"calendarItems": [
-        {"itemType": "workout", "id": 5001, "workoutId": 11, "title": "Push", "date": "2026-06-03"},
-        {"itemType": "workout", "id": 5002, "workoutId": 22, "title": "Legs", "date": "2026-06-05"},
-    ]}
+    payload = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 5001,
+                "workoutId": 11,
+                "title": "Push",
+                "date": "2026-06-03",
+            },
+            {
+                "itemType": "workout",
+                "id": 5002,
+                "workoutId": 22,
+                "title": "Legs",
+                "date": "2026-06-05",
+            },
+        ]
+    }
     wrapper, client = _wrapper_with_months({(2026, 6): payload})
     client.schedule_workout.return_value = {"workoutScheduleId": 6001}
 
@@ -171,10 +263,24 @@ def test_reschedule_no_existing_entries():
 
 def test_reschedule_dedups_multiple_stale_entries():
     """If the same workout was scheduled more than once, all stale copies are removed."""
-    payload = {"calendarItems": [
-        {"itemType": "workout", "id": 8001, "workoutId": 11, "title": "Push", "date": "2026-06-03"},
-        {"itemType": "workout", "id": 8002, "workoutId": 11, "title": "Push", "date": "2026-06-04"},
-    ]}
+    payload = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 8001,
+                "workoutId": 11,
+                "title": "Push",
+                "date": "2026-06-03",
+            },
+            {
+                "itemType": "workout",
+                "id": 8002,
+                "workoutId": 11,
+                "title": "Push",
+                "date": "2026-06-04",
+            },
+        ]
+    }
     wrapper, client = _wrapper_with_months({(2026, 6): payload})
     client.schedule_workout.return_value = {"workoutScheduleId": 9001}
 
@@ -188,9 +294,17 @@ def test_reschedule_tolerates_phantom_entry():
     """A calendar entry that 404s on unschedule (workout-service already dropped it)
     is treated as already-gone — recorded as phantom, not fatal — and the reschedule
     still completes."""
-    payload = {"calendarItems": [
-        {"itemType": "workout", "id": 4040, "workoutId": 11, "title": "Push", "date": "2026-06-03"},
-    ]}
+    payload = {
+        "calendarItems": [
+            {
+                "itemType": "workout",
+                "id": 4040,
+                "workoutId": 11,
+                "title": "Push",
+                "date": "2026-06-03",
+            },
+        ]
+    }
     wrapper, client = _wrapper_with_months({(2026, 6): payload})
     # garminconnect raises a 404 as GarminConnectNotFoundError; unschedule_workout
     # maps it to GarminNotFoundError, which reschedule_workout swallows as "already gone".

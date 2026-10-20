@@ -8,9 +8,9 @@ A Model Context Protocol (MCP) server for Garmin Connect integration. Access you
 
 ## Overview
 
-This MCP server provides 22 tools to interact with your Garmin Connect account, organized into 8 categories:
+This MCP server provides 21 tools to interact with your Garmin Connect account, organized into 8 categories:
 
-- Activities (3 tools) - Query activities and view detailed metrics
+- Activities (2 tools) - Query activities and view detailed metrics
 - Analysis (2 tools) - Compare activities and find similar workouts
 - Health & Wellness (4 tools) - Access health metrics, sleep, heart rate, and activity data
 - Training (3 tools) - Analyze training periods and performance trends
@@ -208,7 +208,6 @@ Use built-in prompt templates for common queries (available via prompt suggestio
 ```
 "Show me my runs from the last 30 days"
 "Get details for my half marathon yesterday including splits and heart rate zones"
-"Show me the comments on my latest cycling activity"
 ```
 
 ### Training Analysis
@@ -241,13 +240,12 @@ _Note: List-returning tools use cursor-based pagination with default limits (10 
 
 ## Available Tools
 
-### Activities (3 tools)
+### Activities (2 tools)
 
 | Tool                   | Description                                                            |
 | ---------------------- | ---------------------------------------------------------------------- |
 | `query-activities`     | Query activities with pagination (by ID, date range, or specific date) |
 | `get-activity-details` | Get comprehensive activity details (splits, weather, HR zones, gear)   |
-| `get-activity-social`  | Get social details for an activity (likes, comments, kudos)            |
 
 ### Analysis (2 tools)
 

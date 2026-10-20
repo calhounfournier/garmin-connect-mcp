@@ -4,7 +4,7 @@ This document provides comprehensive guidance for Claude Code and developers wor
 
 ## Project Overview
 
-A Model Context Protocol (MCP) server that provides LLMs with access to Garmin Connect health and fitness data. The server features a use-case-focused architecture with 22 tools, MCP resources, and prompts for optimal LLM integration.
+A Model Context Protocol (MCP) server that provides LLMs with access to Garmin Connect health and fitness data. The server features a use-case-focused architecture with 21 tools, MCP resources, and prompts for optimal LLM integration.
 
 **Technology Stack:**
 - Python 3.11+
@@ -211,9 +211,9 @@ description = get_range_description("30d")  # "Last 30 days"
 
 ## Available Tools
 
-The server provides **22 tools** organized into 8 categories:
+The server provides **21 tools** organized into 8 categories:
 
-- **Activities (3):** query_activities, get_activity_details, get_activity_social
+- **Activities (2):** query_activities, get_activity_details
 - **Analysis (2):** compare_activities, find_similar_activities
 - **Health & Wellness (4):** query_health_summary, query_sleep_data, query_heart_rate_data, query_activity_metrics
 - **Training (3):** analyze_training_period, get_performance_metrics, get_training_effect

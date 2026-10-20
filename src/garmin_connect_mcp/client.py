@@ -6,10 +6,20 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from garminconnect import Garmin, GarminConnectAuthenticationError
-from garth.exc import GarthHTTPError
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectNotFoundError,
+    GarminConnectTooManyRequestsError,
+)
 
-from .auth import GarminConfig, get_token_base64_path, get_token_store
+from .auth import GarminConfig, get_token_store
+
+# garminconnect 0.3.x keeps its whole session in this one file inside the token
+# store. The garth-era layout (oauth1_token.json + oauth2_token.json) is legacy
+# and unreadable by this version.
+TOKEN_FILE = "garmin_tokens.json"
 
 
 class GarminAPIError(Exception):
@@ -42,7 +52,7 @@ class GarminNotFoundError(GarminAPIError):
 
 
 class GarminTokenFormatError(GarminAPIError):
-    """Token store is non-empty but unreadable by the installed garth version.
+    """Token store is non-empty but holds no token file this garminconnect can read.
 
     Tokens exist, so a credential login is the wrong response: it would send
     Charles an MFA passcode on every tool call. Surfaced as retryable instead.
@@ -50,12 +60,20 @@ class GarminTokenFormatError(GarminAPIError):
 
     def __init__(self, tokenstore: str, original_error: Exception | None = None):
         super().__init__(
-            f"Token store {tokenstore} is non-empty but unreadable by the installed "
-            "garth version (format mismatch). Not attempting a credential login. "
-            "Re-authenticate with 'garmin-connect-mcp-auth' or point GARMINTOKENS "
-            "at a token store this version can read.",
+            f"Token store {tokenstore} has no {TOKEN_FILE} (legacy or unknown "
+            "format). Not attempting a credential login. Re-authenticate with "
+            "'garmin-connect-mcp-auth' in a terminal.",
             original_error=original_error,
         )
+
+
+class GarminMFARequiredError(GarminConnectAuthenticationError):
+    """Garmin asked for an MFA code during a credential login.
+
+    Subclasses garminconnect's authentication error on purpose: its login loop
+    stops on that type and moves to the next strategy on anything else, and every
+    strategy that reaches MFA mails Charles another passcode.
+    """
 
 
 class GarminAuthenticationError(GarminAPIError):
@@ -69,9 +87,9 @@ class GarminAuthenticationError(GarminAPIError):
 
 
 # Module-level cache: the authenticated client is built once and reused across
-# every tool call. garth transparently refreshes the short-lived OAuth2 access
-# token using the long-lived refresh token, so a cached client keeps working for
-# days without re-login (and without ever triggering an MFA SMS).
+# every tool call. garminconnect refreshes the short-lived DI access token with
+# the refresh token and writes the rotated pair back to the token store, so a
+# cached client keeps working without re-login (and without ever triggering MFA).
 _cached_client: Garmin | None = None
 _client_lock = threading.Lock()
 
@@ -83,54 +101,66 @@ def clear_cached_client() -> None:
         _cached_client = None
 
 
-def _is_auth_failure(err: Exception) -> bool:
-    """True only for genuine auth rejections (token truly dead), not transient errors.
+def _status_code(err: Exception) -> int | None:
+    """HTTP status carried by a garminconnect error, if any."""
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    return status if isinstance(status, int) else None
 
-    A 429 rate-limit or a network/5xx blip must NOT be treated as an auth failure —
-    doing so is what cascaded into full credential logins and MFA-passcode spam.
-    """
-    s = str(err)
-    return any(marker in s for marker in ("401", "403", "Unauthorized", "Forbidden"))
+
+def _translate_error(err: Exception, resource: str = "Resource") -> GarminAPIError:
+    """Map a garminconnect exception onto this server's error types."""
+    if isinstance(err, GarminAPIError):
+        return err
+    status = _status_code(err)
+    text = str(err)
+    if isinstance(err, GarminConnectTooManyRequestsError) or status == 429:
+        return GarminRateLimitError(original_error=err)
+    if isinstance(err, GarminConnectNotFoundError) or status == 404:
+        return GarminNotFoundError(resource, original_error=err)
+    if isinstance(err, GarminConnectAuthenticationError) or status in (401, 403):
+        return GarminAuthenticationError(original_error=err)
+    if isinstance(err, GarminConnectConnectionError):
+        return GarminAPIError(f"Garmin API error: {text}", original_error=err)
+    return GarminAPIError(f"Unexpected error: {text}", original_error=err)
 
 
 def _login_with_tokens(tokenstore: str) -> Garmin:
-    """Resume a session from persisted OAuth tokens. Raises on failure."""
+    """Resume a session from the persisted token file. Raises on failure.
+
+    Garmin() is built without email/password, so garminconnect cannot fall back
+    to a credential login inside login(): a missing or rejected token raises
+    GarminConnectAuthenticationError instead of mailing an MFA passcode.
+    """
     token_path = Path(tokenstore)
     if not (token_path.exists() and any(token_path.iterdir())):
         raise FileNotFoundError("No tokens found")
+    if not (token_path / TOKEN_FILE).is_file():
+        # Files exist, so tokens were provisioned, just not in a layout this
+        # version reads. Distinct from "no tokens", which may credential-login.
+        raise GarminTokenFormatError(tokenstore)
     garmin = Garmin()
-    try:
-        garmin.login(tokenstore)
-    except FileNotFoundError as e:
-        # The directory has files, so tokens were provisioned — garth just can't
-        # read this layout. Distinct from "no tokens", which may credential-login.
-        raise GarminTokenFormatError(tokenstore, original_error=e) from e
+    garmin.login(tokenstore)
     return garmin
 
 
+def _refuse_mfa() -> str:
+    raise GarminMFARequiredError(
+        "Garmin requires an MFA code, which cannot be entered from the background "
+        "server. Run 'garmin-connect-mcp-auth' in a terminal to re-authenticate, "
+        "then retry."
+    )
+
+
 def _credential_login(config: GarminConfig, tokenstore: str) -> Garmin:
-    """Full email/password login, used only when saved tokens are truly dead.
+    """Full email/password login, used only on a positively empty token store.
 
-    MFA cannot be completed from a background MCP server (no stdin), so if Garmin
-    demands an MFA code we fail with a clear instruction instead of silently
-    triggering a passcode SMS and then blocking on input().
+    MFA cannot be completed from a background MCP server (no stdin), so the MFA
+    prompt raises instead of blocking on input(). garminconnect writes the new
+    tokens into the token store itself.
     """
-    garmin = Garmin(config.garmin_email, config.garmin_password)
-    result = garmin.login()
-
-    if result and len(result) >= 2:
-        oauth1_token, _ = result
-        mfa_token = getattr(oauth1_token, "mfa_token", None)
-        if mfa_token:
-            raise GarminConnectAuthenticationError(
-                "Garmin requires an MFA code, which cannot be entered from the "
-                "background server. Run 'garmin-connect-mcp-auth' in a terminal to "
-                "re-authenticate, then retry."
-            )
-
-    garmin.garth.dump(tokenstore)
+    garmin = Garmin(config.garmin_email, config.garmin_password, prompt_mfa=_refuse_mfa)
+    garmin.login(tokenstore)
     print(f"OAuth tokens saved to directory: {tokenstore}", file=sys.stderr)
-    Path(get_token_base64_path()).write_text(garmin.garth.dumps())
     return garmin
 
 
@@ -139,12 +169,13 @@ def init_garmin_client(config: GarminConfig, force_refresh: bool = False) -> Gar
     Return an authenticated Garmin client, reusing a cached session when possible.
 
     Strategy:
-    1. Reuse the cached client unless force_refresh is set (garth auto-refreshes
-       the access token via the refresh token, so no re-login/MFA is needed).
-    2. Otherwise resume from persisted OAuth tokens on disk.
-    3. Only fall back to a full credential login when the saved tokens are
-       genuinely rejected (401/403). Transient errors (429/network/5xx) return
-       None so the caller can surface a retryable error — they never trigger MFA.
+    1. Reuse the cached client unless force_refresh is set (garminconnect
+       refreshes the access token itself, so no re-login/MFA is needed).
+    2. Otherwise resume from the token file on disk.
+    3. Credential login happens only when the token store is empty. Tokens that
+       are unreadable or rejected, and transient errors (429/network/5xx), all
+       return None so the caller surfaces a retryable error — none of them can
+       trigger an MFA passcode.
 
     Args:
         config: Garmin configuration with credentials
@@ -168,27 +199,29 @@ def init_garmin_client(config: GarminConfig, force_refresh: bool = False) -> Gar
             _cached_client = garmin
             return garmin
         except GarminTokenFormatError as e:
-            # Tokens exist but this garth can't read them. A credential login here
-            # fires an MFA passcode on every single tool call.
+            # Tokens exist but this version can't read them. A credential login
+            # here fires an MFA passcode on every single tool call.
             print(f"{e.message}", file=sys.stderr)
             return None
         except FileNotFoundError as e:
             # No tokens at all → first-time credential login is legitimate.
             print(f"No saved tokens: {e}. Attempting credential login...", file=sys.stderr)
-        except (GarthHTTPError, GarminConnectAuthenticationError) as e:
-            if not _is_auth_failure(e):
-                # Transient: the saved tokens are almost certainly still valid.
-                # Do NOT re-auth (that's the MFA-storm path). Fail retryably.
-                print(
-                    f"Transient token-login error (not re-authing): {e}", file=sys.stderr
-                )
-                return None
+        except GarminConnectAuthenticationError as e:
+            # Tokens present but rejected. Re-authenticating means MFA, which
+            # only a person at a terminal can complete.
             print(
-                f"Saved tokens rejected ({e}). Attempting credential login...",
+                f"Saved tokens rejected ({e}). Not re-authenticating from the "
+                "background server; run 'garmin-connect-mcp-auth' in a terminal.",
                 file=sys.stderr,
             )
+            return None
+        except Exception as e:
+            # Transient (429/network/5xx): the saved tokens are almost certainly
+            # still valid. Do NOT re-auth (that's the MFA-storm path).
+            print(f"Transient token-login error (not re-authing): {e}", file=sys.stderr)
+            return None
 
-        # Genuine credential login: first run, or saved tokens truly dead.
+        # Genuine credential login: first run on an empty store.
         try:
             garmin = _credential_login(config, tokenstore)
             _cached_client = garmin
@@ -215,8 +248,8 @@ class GarminClientWrapper:
         Safely call a Garmin client method with error handling.
 
         This method uses `Any` as the return type because it dynamically proxies calls
-        to the external garminconnect library, which doesn't have type stubs. The actual
-        return type depends on which Garmin API method is called.
+        to the external garminconnect library. The actual return type depends on which
+        Garmin API method is called.
 
         Args:
             method_name: Name of the Garmin client method to call
@@ -234,82 +267,43 @@ class GarminClientWrapper:
         """
         try:
             method = getattr(self.client, method_name)
-            return method(*args, **kwargs)
         except AttributeError as e:
             raise GarminAPIError(
                 f"Method '{method_name}' not found on Garmin client", original_error=e
             ) from e
-        except GarminConnectAuthenticationError as e:
-            raise GarminAuthenticationError(original_error=e) from e
-        except GarthHTTPError as e:
-            # Parse HTTP status code from error
-            error_str = str(e)
-            if "429" in error_str or "Too Many Requests" in error_str:
-                raise GarminRateLimitError(original_error=e) from e
-            elif "404" in error_str or "Not Found" in error_str:
-                raise GarminNotFoundError(original_error=e) from e
-            elif "401" in error_str or "403" in error_str or "Unauthorized" in error_str:
-                raise GarminAuthenticationError(original_error=e) from e
-            else:
-                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+        try:
+            return method(*args, **kwargs)
         except Exception as e:
-            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+            raise _translate_error(e) from e
 
     def schedule_workout(self, workout_id: int, date: str) -> Any:
         """
-        Schedule a workout to a specific date via POST request.
+        Schedule a workout to a specific date.
 
         Scheduling puts it on the Garmin Connect calendar, which triggers
         auto-sync to the watch (workouts for the next 15 days sync automatically).
         """
         try:
-            url = f"/workout-service/schedule/{workout_id}"
-            payload = {"date": date}
-            response = self.client.garth.post("connectapi", url, json=payload, api=True)
-            try:
-                return response.json()
-            except Exception:
-                return {"status": "ok", "workout_id": workout_id, "date": date}
-        except GarthHTTPError as e:
-            error_str = str(e)
-            if "429" in error_str:
-                raise GarminRateLimitError(original_error=e) from e
-            elif "404" in error_str:
-                raise GarminNotFoundError("Workout", original_error=e) from e
-            elif "401" in error_str or "403" in error_str:
-                raise GarminAuthenticationError(original_error=e) from e
-            else:
-                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+            return self.client.schedule_workout(workout_id, date)
         except Exception as e:
-            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+            raise _translate_error(e, "Workout") from e
 
     def unschedule_workout(self, schedule_id: int) -> Any:
         """
-        Remove a scheduled workout from the Garmin calendar via DELETE request.
+        Remove a scheduled workout from the Garmin calendar.
 
         Args:
             schedule_id: The workoutScheduleId returned when the workout was scheduled.
         """
         try:
-            url = f"/workout-service/schedule/{schedule_id}"
-            response = self.client.garth.delete("connectapi", url, api=True)
+            self.client.unschedule_workout(schedule_id)
             return {"status": "ok", "schedule_id": schedule_id}
-        except GarthHTTPError as e:
-            error_str = str(e)
-            if "429" in error_str:
-                raise GarminRateLimitError(original_error=e) from e
-            elif "404" in error_str:
-                raise GarminNotFoundError("Workout schedule", original_error=e) from e
-            elif "401" in error_str or "403" in error_str:
-                raise GarminAuthenticationError(original_error=e) from e
-            else:
-                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
         except Exception as e:
-            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+            raise _translate_error(e, "Workout schedule") from e
 
     def delete_workout(self, workout_id: int) -> Any:
         """
-        Permanently delete a workout from the Garmin library via DELETE request.
+        Permanently delete a workout from the Garmin library.
 
         Distinct from unschedule_workout: this removes the workout itself from the
         library, not merely a calendar instance. If the workout is currently
@@ -319,31 +313,20 @@ class GarminClientWrapper:
             workout_id: The library workout id (from get_workouts / the 'list' action).
         """
         try:
-            url = f"/workout-service/workout/{workout_id}"
-            self.client.garth.delete("connectapi", url, api=True)
+            self.client.delete_workout(workout_id)
             return {"status": "ok", "workout_id": workout_id}
-        except GarthHTTPError as e:
-            error_str = str(e)
-            if "429" in error_str:
-                raise GarminRateLimitError(original_error=e) from e
-            elif "404" in error_str:
-                raise GarminNotFoundError("Workout", original_error=e) from e
-            elif "401" in error_str or "403" in error_str:
-                raise GarminAuthenticationError(original_error=e) from e
-            else:
-                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
         except Exception as e:
-            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+            raise _translate_error(e, "Workout") from e
 
     def get_scheduled_workouts(self, start_date: str, end_date: str) -> list[dict]:
         """
         List workouts scheduled on the Garmin calendar within a date range.
 
-        The garminconnect library doesn't expose the calendar service, so we call
-        garth directly. The calendar-service month endpoint uses a 0-indexed month
-        (0 = January) and returns ``calendarItems``; for workout items the ``id``
-        field IS the workoutScheduleId needed to unschedule, and ``workoutId`` is
-        the library workout id.
+        garminconnect reads the calendar one month at a time (1-indexed month; it
+        converts to the calendar service's 0-indexed month itself) and returns
+        ``calendarItems``; for workout items the ``id`` field IS the
+        workoutScheduleId needed to unschedule, and ``workoutId`` is the library
+        workout id.
 
         Args:
             start_date: Range start, YYYY-MM-DD (inclusive).
@@ -359,27 +342,33 @@ class GarminClientWrapper:
             ey, em, ed = (int(p) for p in end_date.split("-"))
             start = _date(sy, sm, sd)
             end = _date(ey, em, ed)
-            if end < start:
-                start, end = end, start
+        except (ValueError, TypeError) as e:
+            raise GarminAPIError(
+                f"Invalid date (expected YYYY-MM-DD): {str(e)}", original_error=e
+            ) from e
+        if end < start:
+            start, end = end, start
 
-            start_iso, end_iso = start.isoformat(), end.isoformat()
-            results: list[dict] = []
-            # calendar-service month payloads include adjacent-month grid-overflow
-            # days, so a date near a month boundary appears in two months' payloads.
-            # Dedupe by scheduleId so each scheduled workout is returned once.
-            seen_ids: set = set()
-            year, month = start.year, start.month
+        start_iso, end_iso = start.isoformat(), end.isoformat()
+        results: list[dict] = []
+        # Month payloads include adjacent-month grid-overflow days, so a date near
+        # a month boundary appears in two months' payloads. Dedupe by scheduleId
+        # so each scheduled workout is returned once.
+        seen_ids: set = set()
+        year, month = start.year, start.month
+        try:
             while (year, month) <= (end.year, end.month):
-                # calendar-service month is 0-indexed (0 = January)
-                url = f"/calendar-service/year/{year}/month/{month - 1}"
-                response = self.client.garth.get("connectapi", url, api=True)
-                data = response.json()
+                data = self.client.get_scheduled_workouts(year, month) or {}
                 for item in data.get("calendarItems", []) or []:
                     if item.get("itemType") != "workout":
                         continue
                     item_date = item.get("date")
                     schedule_id = item.get("id")
-                    if item_date and start_iso <= item_date <= end_iso and schedule_id not in seen_ids:
+                    if (
+                        item_date
+                        and start_iso <= item_date <= end_iso
+                        and schedule_id not in seen_ids
+                    ):
                         seen_ids.add(schedule_id)
                         results.append(
                             {
@@ -392,21 +381,11 @@ class GarminClientWrapper:
                 month = 1 if month == 12 else month + 1
                 if month == 1:
                     year += 1
-
-            results.sort(key=lambda r: (r.get("date") or "", r.get("title") or ""))
-            return results
-        except GarthHTTPError as e:
-            error_str = str(e)
-            if "429" in error_str:
-                raise GarminRateLimitError(original_error=e) from e
-            elif "401" in error_str or "403" in error_str:
-                raise GarminAuthenticationError(original_error=e) from e
-            else:
-                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
-        except (ValueError, TypeError) as e:
-            raise GarminAPIError(f"Invalid date (expected YYYY-MM-DD): {str(e)}", original_error=e) from e
         except Exception as e:
-            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+            raise _translate_error(e, "Calendar month") from e
+
+        results.sort(key=lambda r: (r.get("date") or "", r.get("title") or ""))
+        return results
 
     def reschedule_workout(
         self,
@@ -437,13 +416,16 @@ class GarminClientWrapper:
         Returns:
             {workout_id, scheduled_date, new_schedule_id, removed_duplicates, schedule_result}
         """
-        from datetime import date as _date, timedelta
+        from datetime import date as _date
+        from datetime import timedelta
 
         try:
             ty, tm, td = (int(p) for p in date.split("-"))
             target = _date(ty, tm, td)
         except (ValueError, TypeError) as e:
-            raise GarminAPIError(f"Invalid date (expected YYYY-MM-DD): {str(e)}", original_error=e) from e
+            raise GarminAPIError(
+                f"Invalid date (expected YYYY-MM-DD): {str(e)}", original_error=e
+            ) from e
 
         window_start = search_start or (target - timedelta(days=14)).isoformat()
         window_end = search_end or (target + timedelta(days=21)).isoformat()
@@ -480,33 +462,18 @@ class GarminClientWrapper:
 
     def update_workout(self, workout_id: int, workout_data: str | dict) -> Any:
         """
-        Update an existing workout by ID via PUT request.
+        Replace an existing workout in place, keeping its id.
 
-        The garminconnect library doesn't expose this, so we call garth directly.
+        Garmin's workout endpoint replaces the whole workout, so ``workout_data``
+        must be the complete structure (as returned by ``get_workout_by_id``).
+        Calendar schedules pointing at the workout stay valid.
         """
         try:
-            if isinstance(workout_data, str):
-                payload = _json.loads(workout_data)
-            else:
-                payload = workout_data
-
-            url = f"/workout-service/workout/{workout_id}"
-            response = self.client.garth.put("connectapi", url, json=payload, api=True)
-            try:
-                return response.json()
-            except Exception:
-                return {"status": "ok", "workout_id": workout_id}
-        except GarthHTTPError as e:
-            error_str = str(e)
-            if "429" in error_str:
-                raise GarminRateLimitError(original_error=e) from e
-            elif "404" in error_str:
-                raise GarminNotFoundError("Workout", original_error=e) from e
-            elif "401" in error_str or "403" in error_str:
-                raise GarminAuthenticationError(original_error=e) from e
-            else:
-                raise GarminAPIError(f"Garmin API error: {str(e)}", original_error=e) from e
+            payload = _json.loads(workout_data) if isinstance(workout_data, str) else workout_data
         except _json.JSONDecodeError as e:
             raise GarminAPIError(f"Invalid workout JSON: {str(e)}", original_error=e) from e
+        try:
+            result = self.client.update_workout(workout_id, payload)
+            return result or {"status": "ok", "workout_id": workout_id}
         except Exception as e:
-            raise GarminAPIError(f"Unexpected error: {str(e)}", original_error=e) from e
+            raise _translate_error(e, "Workout") from e
