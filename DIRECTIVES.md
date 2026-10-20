@@ -12,6 +12,18 @@ _(none)_
 
 ## Processed
 
+### D-004 — Edit a workout in place (`manage_workouts` action `patch`)
+
+**Processed:** 2026-10-20
+
+**Source:** Charles, 2026-10-20 (« do 1 2 and 3 »), on the recommendation made after he asked why I bypass the MCP: on 10-14 a 39-step card had to be edited through raw garth because `update` needs the whole workout JSON.
+
+**Scope:** `client.py` (`patch_workout`), `tools/workouts.py` (`patch` action, `workout_updates` and `step_updates` params), `tests/test_patch_workout.py`.
+
+**Outcome:** `patch_workout` fetches the card, merges top-level fields and per-step fields addressed by `stepOrder` (unique across the card, repeat-group children included), validates everything before writing (unknown or duplicate stepOrder, missing fields, structural keys `workoutId`/`workoutSegments`/`stepOrder`/`workoutSteps`/`childStepId`), skips the write when nothing differs, and returns each field's before/after. Commits `5d7c68e` (tests, RED: 14 failed) and the implementation commit.
+
+**Verification:** 156 passed. Live on a throwaway run card with a repeat group: renamed it and changed a nested step's duration and description; the other steps and the iteration count came back identical; a repeat of the same patch returned `written: False`; card deleted, 404 confirmed.
+
 ### D-003 — Port to garminconnect 0.3.19
 
 **Processed:** 2026-10-20

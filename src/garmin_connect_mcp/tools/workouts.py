@@ -1,5 +1,6 @@
 """Workout management tools for Garmin Connect MCP server."""
 
+import json
 from typing import Annotated
 
 from fastmcp import Context
@@ -9,13 +10,21 @@ from ..response_builder import ResponseBuilder
 
 
 async def manage_workouts(
-    action: Annotated[str, "Action: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'schedule', 'reschedule', 'unschedule', 'delete'"],
+    action: Annotated[str, "Action: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'patch', 'schedule', 'reschedule', 'unschedule', 'delete'"],
     workout_id: Annotated[int | None, "Workout ID (for get/download/update/schedule/delete actions)"] = None,
     workout_data: Annotated[str | None, "Workout data (for upload/update actions)"] = None,
     schedule_date: Annotated[str | None, "Date to schedule workout (YYYY-MM-DD format, for schedule action)"] = None,
     schedule_id: Annotated[int | None, "Workout schedule ID (for unschedule action — returned by schedule action as workoutScheduleId)"] = None,
     start_date: Annotated[str | None, "Range start YYYY-MM-DD (for list_scheduled action)"] = None,
     end_date: Annotated[str | None, "Range end YYYY-MM-DD (for list_scheduled action)"] = None,
+    workout_updates: Annotated[
+        str | None,
+        'JSON object of top-level fields to change (for patch), e.g. {"workoutName": "Pull (deload)"}',
+    ] = None,
+    step_updates: Annotated[
+        str | None,
+        'JSON list of step changes keyed by stepOrder (for patch), e.g. [{"stepOrder": 4, "weightValue": 72.5}]',
+    ] = None,
     ctx: Context | None = None,
 ) -> str:
     """
@@ -29,7 +38,12 @@ async def manage_workouts(
     - get: Get specific workout by ID
     - download: Download workout file
     - upload: Upload a new workout
-    - update: Update an existing workout (provide workout_id and workout_data)
+    - update: Replace an existing workout (provide workout_id and the FULL workout_data)
+    - patch: Change named fields in place (provide workout_id plus workout_updates
+      and/or step_updates). Steps are addressed by stepOrder, which is unique across
+      the card including repeat-group children (read it with 'get'). Only the named
+      fields change; the rest of the card is sent back untouched. Prefer this over
+      update for weight, reps, rest or description edits.
     - schedule: Schedule a workout to a date (syncs to watch automatically)
     - reschedule: Move a workout to a date, first removing any existing entry for
       that workout in the window (duplicate-proof — prefer this over schedule when
@@ -136,6 +150,36 @@ async def manage_workouts(
                 metadata={"action": "update", "workout_id": workout_id},
             )
 
+        elif action == "patch":
+            if workout_id is None:
+                return ResponseBuilder.build_error_response(
+                    "Workout ID required for patch action",
+                    "invalid_parameters",
+                    ["Provide workout_id parameter"],
+                )
+            try:
+                top = json.loads(workout_updates) if workout_updates else None
+                steps = json.loads(step_updates) if step_updates else None
+            except json.JSONDecodeError as e:
+                return ResponseBuilder.build_error_response(
+                    f"Invalid JSON in workout_updates/step_updates: {e}",
+                    "invalid_parameters",
+                    ["workout_updates is a JSON object, step_updates a JSON list"],
+                )
+
+            result = client.patch_workout(workout_id, workout_updates=top, step_updates=steps)
+            changed = len(result.get("changes", []))
+            insight = (
+                f"Changed {changed} field(s) and saved the workout"
+                if result.get("written")
+                else "No field differed from the card; nothing was written"
+            )
+            return ResponseBuilder.build_response(
+                data={"result": result},
+                analysis={"insights": [insight]},
+                metadata={"action": "patch", "workout_id": workout_id},
+            )
+
         elif action == "schedule":
             if workout_id is None:
                 return ResponseBuilder.build_error_response(
@@ -221,7 +265,7 @@ async def manage_workouts(
             return ResponseBuilder.build_error_response(
                 f"Invalid action: {action}",
                 "invalid_parameters",
-                ["Valid actions: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'schedule', 'reschedule', 'unschedule', 'delete'"],
+                ["Valid actions: 'list', 'list_scheduled', 'get', 'download', 'upload', 'update', 'patch', 'schedule', 'reschedule', 'unschedule', 'delete'"],
             )
 
     except GarminAPIError as e:

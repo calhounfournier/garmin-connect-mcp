@@ -25,18 +25,46 @@ CARD = {
         {
             "segmentOrder": 1,
             "workoutSteps": [
-                {"stepOrder": 1, "type": "ExecutableStepDTO", "exerciseName": "PULL_UP",
-                 "weightValue": 0.0, "endConditionValue": 0.0, "description": "Strict pull-up"},
-                {"stepOrder": 2, "type": "ExecutableStepDTO", "exerciseName": None,
-                 "weightValue": 0.0, "endConditionValue": 180.0, "description": None},
-                {"stepOrder": 3, "type": "RepeatGroupDTO", "numberOfIterations": 4,
-                 "endConditionValue": 4.0, "workoutSteps": [
-                     {"stepOrder": 4, "type": "ExecutableStepDTO",
-                      "exerciseName": "WEIGHTED_PULL_UP", "weightValue": 74.8,
-                      "endConditionValue": 8.0, "description": "Assisted pull-up"},
-                     {"stepOrder": 5, "type": "ExecutableStepDTO", "exerciseName": None,
-                      "weightValue": 0.0, "endConditionValue": 120.0, "description": None},
-                 ]},
+                {
+                    "stepOrder": 1,
+                    "type": "ExecutableStepDTO",
+                    "exerciseName": "PULL_UP",
+                    "weightValue": 0.0,
+                    "endConditionValue": 0.0,
+                    "description": "Strict pull-up",
+                },
+                {
+                    "stepOrder": 2,
+                    "type": "ExecutableStepDTO",
+                    "exerciseName": None,
+                    "weightValue": 0.0,
+                    "endConditionValue": 180.0,
+                    "description": None,
+                },
+                {
+                    "stepOrder": 3,
+                    "type": "RepeatGroupDTO",
+                    "numberOfIterations": 4,
+                    "endConditionValue": 4.0,
+                    "workoutSteps": [
+                        {
+                            "stepOrder": 4,
+                            "type": "ExecutableStepDTO",
+                            "exerciseName": "WEIGHTED_PULL_UP",
+                            "weightValue": 74.8,
+                            "endConditionValue": 8.0,
+                            "description": "Assisted pull-up",
+                        },
+                        {
+                            "stepOrder": 5,
+                            "type": "ExecutableStepDTO",
+                            "exerciseName": None,
+                            "weightValue": 0.0,
+                            "endConditionValue": 120.0,
+                            "description": None,
+                        },
+                    ],
+                },
             ],
         }
     ],
@@ -87,7 +115,10 @@ def test_patch_top_level_and_several_steps():
     assert group["numberOfIterations"] == 3
     assert group["workoutSteps"][1]["endConditionValue"] == 90.0
     # untouched step identical
-    assert sent["workoutSegments"][0]["workoutSteps"][0] == CARD["workoutSegments"][0]["workoutSteps"][0]
+    assert (
+        sent["workoutSegments"][0]["workoutSteps"][0]
+        == CARD["workoutSegments"][0]["workoutSteps"][0]
+    )
     assert {(c["stepOrder"], c["field"]) for c in result["changes"]} == {
         (None, "workoutName"),
         (3, "numberOfIterations"),
@@ -100,7 +131,11 @@ def test_patch_unknown_step_writes_nothing():
     wrapper, client = _wrapper()
     with pytest.raises(GarminAPIError, match="stepOrder 9"):
         wrapper.patch_workout(
-            77, step_updates=[{"stepOrder": 4, "weightValue": 70.0}, {"stepOrder": 9, "weightValue": 1.0}]
+            77,
+            step_updates=[
+                {"stepOrder": 4, "weightValue": 70.0},
+                {"stepOrder": 9, "weightValue": 1.0},
+            ],
         )
     client.update_workout.assert_not_called()
 
@@ -170,7 +205,9 @@ async def test_tool_patch_parses_json_and_calls_client():
 
     assert "error" not in out
     client.patch_workout.assert_called_once_with(
-        77, workout_updates={"workoutName": "X"}, step_updates=[{"stepOrder": 4, "weightValue": 72.5}]
+        77,
+        workout_updates={"workoutName": "X"},
+        step_updates=[{"stepOrder": 4, "weightValue": 72.5}],
     )
 
 
@@ -185,6 +222,8 @@ async def test_tool_patch_requires_workout_id():
 @pytest.mark.asyncio
 async def test_tool_patch_rejects_invalid_json():
     client = MagicMock()
-    out = json.loads(await manage_workouts("patch", workout_id=77, step_updates="[{bad", ctx=_ctx(client)))
+    out = json.loads(
+        await manage_workouts("patch", workout_id=77, step_updates="[{bad", ctx=_ctx(client))
+    )
     assert "error" in out
     client.patch_workout.assert_not_called()

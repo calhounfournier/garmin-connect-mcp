@@ -1,5 +1,6 @@
 """Garmin Connect API client wrapper with error handling."""
 
+import copy
 import json as _json
 import sys
 import threading
@@ -477,3 +478,99 @@ class GarminClientWrapper:
             return result or {"status": "ok", "workout_id": workout_id}
         except Exception as e:
             raise _translate_error(e, "Workout") from e
+
+    # Fields a patch may not touch: they identify the card or carry its structure.
+    _PATCH_LOCKED_TOP = frozenset({"workoutId", "workoutSegments"})
+    _PATCH_LOCKED_STEP = frozenset({"stepOrder", "workoutSteps", "childStepId"})
+
+    def patch_workout(
+        self,
+        workout_id: int,
+        workout_updates: dict | None = None,
+        step_updates: list[dict] | None = None,
+    ) -> dict:
+        """
+        Change named fields of a workout in place and save it once.
+
+        Fetches the card, merges ``workout_updates`` into its top level and each
+        entry of ``step_updates`` into the step with that ``stepOrder`` (unique
+        across the card, repeat-group children included), then sends the whole
+        card back through ``update_workout``. Every requested change is validated
+        before anything is written; a card with no effective change is not sent.
+
+        Returns:
+            {workout_id, changes: [{stepOrder, field, before, after}], written}
+        """
+        workout_updates = workout_updates or {}
+        step_updates = step_updates or []
+        if not workout_updates and not step_updates:
+            raise GarminAPIError("Nothing to patch: provide workout_updates or step_updates")
+
+        locked = sorted(self._PATCH_LOCKED_TOP & workout_updates.keys())
+        if locked:
+            raise GarminAPIError(
+                f"Cannot patch {', '.join(locked)}; use update for structural changes"
+            )
+
+        wanted: dict[int, dict] = {}
+        for update in step_updates:
+            if not isinstance(update, dict) or "stepOrder" not in update:
+                raise GarminAPIError("Each step update needs a stepOrder")
+            order = update["stepOrder"]
+            if order in wanted:
+                raise GarminAPIError(f"stepOrder {order} appears twice in step_updates")
+            fields = {k: v for k, v in update.items() if k != "stepOrder"}
+            if not fields:
+                raise GarminAPIError(f"stepOrder {order} has no fields to change")
+            locked = sorted(self._PATCH_LOCKED_STEP & fields.keys())
+            if locked:
+                raise GarminAPIError(f"Cannot patch {', '.join(locked)} on stepOrder {order}")
+            wanted[order] = fields
+
+        workout = copy.deepcopy(self.safe_call("get_workout_by_id", workout_id))
+
+        steps_by_order: dict[int, dict] = {}
+
+        def index(steps: list[dict]) -> None:
+            for step in steps or []:
+                steps_by_order[step.get("stepOrder")] = step
+                index(step.get("workoutSteps") or [])
+
+        for segment in workout.get("workoutSegments") or []:
+            index(segment.get("workoutSteps") or [])
+
+        missing = sorted(o for o in wanted if o not in steps_by_order)
+        if missing:
+            raise GarminAPIError(
+                f"stepOrder {', '.join(map(str, missing))} not found in workout {workout_id}"
+            )
+
+        changes: list[dict] = []
+        for field, value in workout_updates.items():
+            if workout.get(field) != value:
+                changes.append(
+                    {
+                        "stepOrder": None,
+                        "field": field,
+                        "before": workout.get(field),
+                        "after": value,
+                    }
+                )
+                workout[field] = value
+        for order, fields in wanted.items():
+            step = steps_by_order[order]
+            for field, value in fields.items():
+                if step.get(field) != value:
+                    changes.append(
+                        {
+                            "stepOrder": order,
+                            "field": field,
+                            "before": step.get(field),
+                            "after": value,
+                        }
+                    )
+                    step[field] = value
+
+        if changes:
+            self.update_workout(workout_id, workout)
+        return {"workout_id": workout_id, "changes": changes, "written": bool(changes)}
